@@ -8,6 +8,7 @@
 #define WEECHAT_PLUGIN_IRC_BATCH_H
 
 #include <time.h>
+#include <stddef.h>
 
 struct t_hashtable;
 struct t_irc_server;
@@ -22,6 +23,10 @@ struct t_irc_batch
     time_t start_time;                  /* start time (to auto-purge if     */
                                         /* batch end is not received)       */
     char **messages;                    /* messages separated by '\n'       */
+    int history_managed;               /* negotiated at batch start        */
+    size_t history_bytes;              /* bounded history payload size     */
+    int history_count;                 /* bounded history message count    */
+    int history_invalid;               /* incomplete/unsupported history   */
     int end_received;                   /* batch end reference received     */
     int messages_processed;             /* 1 if msgs have been processed    */
     struct t_irc_batch *prev_batch;     /* link to previous batch           */

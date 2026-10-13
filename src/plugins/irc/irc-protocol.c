@@ -29,6 +29,7 @@
 #include "irc-protocol.h"
 #include "irc-bar-item.h"
 #include "irc-batch.h"
+#include "irc-history.h"
 #include "irc-buffer.h"
 #include "irc-channel.h"
 #include "irc-color.h"
@@ -896,6 +897,14 @@ irc_protocol_cap_sync (struct t_irc_server *server, int sasl, int cap_new_receiv
                                                   (const char **)list_caps_to_enable,
                                                   0))
                 {
+                    if (strcmp (caps_server[i], "draft/chathistory") == 0
+                        && (!weechat_hashtable_has_key (server->cap_ls, "batch")
+                            || !weechat_hashtable_has_key (server->cap_ls, "server-time")
+                            || !weechat_hashtable_has_key (server->cap_ls, "message-tags")
+                            || !weechat_string_match_list ("batch", (const char **)list_caps_to_enable, 0)
+                            || !weechat_string_match_list ("server-time", (const char **)list_caps_to_enable, 0)
+                            || !weechat_string_match_list ("message-tags", (const char **)list_caps_to_enable, 0)))
+                        continue;
                     if (sasl && strcmp (caps_server[i], "sasl") == 0)
                         sasl_to_do = 1;
                     if ((*cap_req)[0])
@@ -1621,6 +1630,8 @@ IRC_PROTOCOL_CALLBACK(fail)
 {
     IRC_PROTOCOL_MIN_PARAMS(2);
 
+    irc_history_fail (ctxt);
+
     irc_protocol_print_error_warning_msg (ctxt,
                                           weechat_prefix ("error"),
                                           _("Failure:"));
@@ -1807,6 +1818,9 @@ IRC_PROTOCOL_CALLBACK(join)
         0,  /* away */
         (pos_account) ? pos_account : NULL,
         (pos_realname) ? pos_realname : NULL);
+
+    if (ctxt->nick_is_me)
+        irc_history_request (ctxt->server, ptr_channel->name);
 
     /* Rename the nick if it was in list with a different case. */
     irc_channel_nick_speaking_rename_if_present (ctxt->server, ptr_channel, ctxt->nick);
@@ -8125,6 +8139,17 @@ irc_protocol_recv_command (struct t_irc_server *server,
             ptr_msg_after_tags = NULL;
     }
 
+    /* Do not let a capability withdrawal turn pending replay into live IRC. */
+    if (ctxt.tags && !irc_history_enabled (server))
+    {
+        struct t_irc_batch *history_batch;
+
+        ptr_batch_ref = weechat_hashtable_get (ctxt.tags, "batch");
+        history_batch = irc_batch_search (server, ptr_batch_ref);
+        if (history_batch && history_batch->history_managed)
+            goto end;
+    }
+
     /* If message is not BATCH but has a batch tag, just store it for later. */
     if (!ignore_batch_tag
         && ctxt.tags
@@ -8135,6 +8160,9 @@ irc_protocol_recv_command (struct t_irc_server *server,
         if (ptr_batch_ref)
         {
             if (irc_batch_add_message (server, ptr_batch_ref, irc_message))
+                goto end;
+            /* Unknown references must not leak malformed replay into live state. */
+            if (irc_history_enabled (server))
                 goto end;
         }
     }
@@ -8256,6 +8284,8 @@ irc_protocol_recv_command (struct t_irc_server *server,
                            NULL,  /* pos_channel */
                            NULL);  /* pos_text */
 
+        if (irc_history_live (&ctxt))
+            goto end;
         return_code = (int) (cmd_recv_func) (&ctxt);
 
         if (return_code == WEECHAT_RC_ERROR)

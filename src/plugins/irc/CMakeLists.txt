@@ -14,6 +14,7 @@ add_library(irc MODULE
   irc-config.c irc-config.h
   irc-ctcp.c irc-ctcp.h
   irc-debug.c irc-debug.h
+  irc-history.c irc-history.h
   irc-ignore.c irc-ignore.h
   irc-info.c irc-info.h
   irc-input.c irc-input.h

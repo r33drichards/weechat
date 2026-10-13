@@ -40,6 +40,7 @@
 #include "irc-server.h"
 #include "irc-bar-item.h"
 #include "irc-batch.h"
+#include "irc-history.h"
 #include "irc-buffer.h"
 #include "irc-channel.h"
 #include "irc-color.h"
@@ -2369,6 +2370,8 @@ irc_server_free (struct t_irc_server *server)
     if (!server)
         return;
 
+    irc_history_forget (server);
+
     /*
      * Close server buffer (and all channels/privates)
      * (only if we are not in a /upgrade, because during upgrade we want to
@@ -4268,6 +4271,8 @@ irc_server_close_connection (struct t_irc_server *server)
 
     /* Remove all /names filters. */
     weechat_hashtable_remove_all (server->names_channel_filter);
+
+    irc_history_disconnect (server);
 
     /* Remove all batched events pending. */
     irc_batch_free_all (server);

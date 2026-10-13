@@ -15,6 +15,7 @@
 #include "../weechat-plugin.h"
 #include "irc.h"
 #include "irc-batch.h"
+#include "irc-history.h"
 #include "irc-message.h"
 #include "irc-protocol.h"
 #include "irc-raw.h"
@@ -99,15 +100,37 @@ irc_batch_start_batch (struct t_irc_server *server, const char *reference,
                        const char *parent_ref, const char *type,
                        const char *parameters, struct t_hashtable *tags)
 {
-    struct t_irc_batch *ptr_batch;
+    struct t_irc_batch *ptr_batch, *parent;
+    int count;
 
     if (!server || !reference || !type)
         return NULL;
 
+    parent = irc_batch_search (server, parent_ref);
+    if (parent && parent->history_managed)
+    {
+        parent->history_invalid = 1;
+        return NULL;
+    }
+    if (strcmp (type, "chathistory") == 0
+        && weechat_hashtable_has_key (server->cap_list, "draft/chathistory"))
+    {
+        count = 0;
+        for (ptr_batch = server->batches; ptr_batch;
+             ptr_batch = ptr_batch->next_batch)
+            count++;
+        if (count >= 16)
+            return NULL;
+    }
+
     /* Check if reference already exists. */
     ptr_batch = irc_batch_search (server, reference);
     if (ptr_batch)
+    {
+        if (ptr_batch->history_managed)
+            ptr_batch->history_invalid = 1;
         return NULL;
+    }
 
     ptr_batch = malloc (sizeof (*ptr_batch));
     if (!ptr_batch)
@@ -120,6 +143,11 @@ irc_batch_start_batch (struct t_irc_server *server, const char *reference,
     ptr_batch->tags = (tags) ? weechat_hashtable_dup (tags) : NULL;
     ptr_batch->start_time = time (NULL);
     ptr_batch->messages = NULL;
+    ptr_batch->history_managed = (strcmp (type, "chathistory") == 0
+        && weechat_hashtable_has_key (server->cap_list, "draft/chathistory"));
+    ptr_batch->history_bytes = 0;
+    ptr_batch->history_count = 0;
+    ptr_batch->history_invalid = 0;
     ptr_batch->end_received = 0;
     ptr_batch->messages_processed = 0;
 
@@ -148,6 +176,22 @@ irc_batch_add_message (struct t_irc_server *server, const char *reference,
     ptr_batch = irc_batch_search (server, reference);
     if (!ptr_batch)
         return 0;
+
+    if (ptr_batch->history_managed)
+    {
+        if (ptr_batch->history_invalid)
+            return 1;
+        ptr_batch->history_count++;
+        ptr_batch->history_bytes += strlen (irc_message);
+        if (ptr_batch->history_count > 1000
+            || ptr_batch->history_bytes > 1024 * 1024)
+        {
+            ptr_batch->history_invalid = 1;
+            weechat_string_dyn_free (ptr_batch->messages, 1);
+            ptr_batch->messages = NULL;
+            return 1;
+        }
+    }
 
     if (!ptr_batch->messages)
         ptr_batch->messages = weechat_string_dyn_alloc (256);
@@ -214,6 +258,11 @@ irc_batch_process_messages (struct t_irc_server *server,
     struct t_hashtable *tags;
     int i, count_messages;
 
+    if (batch && batch->history_managed)
+    {
+        irc_history_batch (server, batch);
+        return;
+    }
     if (!batch || !batch->messages)
         return;
 
