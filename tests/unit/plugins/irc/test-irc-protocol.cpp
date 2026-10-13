@@ -21,12 +21,14 @@ extern "C"
 #include "src/core/core-config-file.h"
 #include "src/core/core-hashtable.h"
 #include "src/core/core-hook.h"
+#include "src/core/hook/hook-print.h"
 #include "src/core/core-input.h"
 #include "src/core/core-string.h"
 #include "src/gui/gui-buffer.h"
 #include "src/gui/gui-color.h"
 #include "src/plugins/plugin.h"
 #include "src/plugins/irc/irc-batch.h"
+#include "src/plugins/irc/irc-history.h"
 #include "src/plugins/irc/irc-ctcp.h"
 #include "src/plugins/irc/irc-protocol.h"
 #include "src/plugins/irc/irc-channel.h"
@@ -7975,4 +7977,341 @@ TEST(IrcProtocolWithServer, server_mode_reason)
     CHECK_SRV("--", "bob: mode test", "irc_975,irc_numeric,nick_server,log3");
     RECV(":server 975 bob mode : test ");
     CHECK_SRV("--", "bob: mode  test ", "irc_975,irc_numeric,nick_server,log3");
+}
+
+/*
+ * CHATHISTORY protocol fixtures use the real receive and output paths.
+ */
+
+#define HISTORY_CAPS "batch server-time message-tags draft/chathistory"
+#define HISTORY_SETUP \
+    SRV_INIT_JOIN; \
+    RECV(":server CAP alice ACK :" HISTORY_CAPS); \
+    RECV(":server 005 alice CHATHISTORY=2 MSGREFTYPES=msgid,timestamp :supported");
+#define HISTORY_TAGS "irc_chathistory,irc_batch_type_chathistory,notify_none,no_highlight,no_log"
+
+TEST(IrcProtocolWithServer, HistoryNegotiation)
+{
+    SRV_INIT_JOIN;
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT(NULL);
+    RECV(":server CAP alice ACK :batch server-time message-tags");
+    RECV(":server 005 alice CHATHISTORY=2 :supported");
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT(NULL);
+    RECV(":server CAP alice ACK :draft/chathistory");
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT("CHATHISTORY LATEST #test * 2");
+    RECV(":server CAP alice DEL :draft/chathistory");
+    LONGS_EQUAL(0, irc_history_enabled (ptr_server));
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT(NULL);
+}
+
+TEST(IrcProtocolWithServer, HistoryReplayAndLiveDuplicate)
+{
+    HISTORY_SETUP;
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT("CHATHISTORY LATEST #test * 2");
+    RECV(":server BATCH +h chathistory #test");
+    RECV("@batch=h;time=2026-10-13T10:00:01.000Z;msgid=a :bob!u@h PRIVMSG #test :old");
+    RECORD_CHECK_NO_MSG();
+    RECV("@time=2026-10-13T10:00:02.000Z;msgid=b :bob!u@h PRIVMSG #test :live");
+    RECV("@batch=h;time=2026-10-13T10:00:02.000Z;msgid=b :bob!u@h PRIVMSG #test :live");
+    RECV(":server BATCH -h");
+    CHECK_CHAN("bob", "old", HISTORY_TAGS);
+    LONGS_EQUAL(1, record_count_messages ());
+    irc_history_disconnect (ptr_server);
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT("CHATHISTORY AFTER #test msgid=b 2");
+}
+
+TEST(IrcProtocolWithServer, HistoryPartialAndMalformed)
+{
+    HISTORY_SETUP;
+    irc_history_request (ptr_server, "#test");
+    RECV(":server BATCH +h chathistory #test");
+    RECV("@batch=h;time=2026-10-13T10:00:01.000Z :bob!u@h PRIVMSG #test :partial");
+    RECORD_CHECK_NO_MSG();
+    irc_batch_free_all (ptr_server);
+    irc_history_disconnect (ptr_server);
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT("CHATHISTORY LATEST #test * 2");
+    RECV(":server BATCH +bad chathistory #test");
+    RECV("@batch=bad;time=not-a-time :bob!u@h PRIVMSG #test :bad");
+    RECV(":server BATCH -bad");
+    CHECK(!record_search ("irc.fake.#test", "bob", "bad", NULL));
+    irc_history_disconnect (ptr_server);
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT("CHATHISTORY LATEST #test * 2");
+}
+
+TEST(IrcProtocolWithServer, HistoryEmptyAndTimestampFallback)
+{
+    HISTORY_SETUP;
+    RECV("@time=2026-10-13T10:00:01.123Z :bob!u@h PRIVMSG #test :seen");
+    irc_history_disconnect (ptr_server);
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT("CHATHISTORY AFTER #test timestamp=2026-10-13T10:00:01.122Z 2");
+    RECV(":server BATCH +empty chathistory #test");
+    RECV(":server BATCH -empty");
+    RECORD_CHECK_NO_MSG();
+    CHECK_SENT(NULL);
+    RECV(":server 005 alice MSGREFTYPES=unknown :supported");
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT(NULL);
+}
+
+TEST(IrcProtocolWithServer, HistoryPagination)
+{
+    HISTORY_SETUP;
+    RECV("@time=2026-10-13T10:00:00.000Z;msgid=a :bob!u@h PRIVMSG #test :start");
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT("CHATHISTORY AFTER #test msgid=a 2");
+    RECV(":server BATCH +page chathistory #test");
+    RECV("@batch=page;time=2026-10-13T10:00:01.000Z;msgid=b :bob!u@h PRIVMSG #test :next");
+    RECV(":server BATCH -page");
+    CHECK_SENT("CHATHISTORY AFTER #test msgid=b 2");
+    RECV("@draft/chathistory-end :server BATCH +last chathistory #test");
+    RECV("@batch=last;time=2026-10-13T10:00:02.000Z;msgid=c :bob!u@h PRIVMSG #test :last");
+    RECV(":server BATCH -last");
+    CHECK_SENT(NULL);
+    CHECK_CHAN("bob", "last", HISTORY_TAGS);
+}
+
+TEST(IrcProtocolWithServer, HistoryRejectsStateChangesAndUnknownBatches)
+{
+    HISTORY_SETUP;
+    irc_history_request (ptr_server, "#test");
+    RECV(":server BATCH +h chathistory #test");
+    RECV("@batch=h;time=2026-10-13T10:00:01.000Z :alice!u@h NICK changed");
+    RECV(":server BATCH -h");
+    STRCMP_EQUAL("alice", ptr_server->nick);
+    RECV("@batch=missing :alice!u@h NICK changed");
+    STRCMP_EQUAL("alice", ptr_server->nick);
+}
+
+TEST(IrcProtocolWithServer, HistoryWithdrawalDuringBatch)
+{
+    HISTORY_SETUP;
+    irc_history_request (ptr_server, "#test");
+    RECV(":server BATCH +h chathistory #test");
+    RECV("@batch=h;time=2026-10-13T10:00:01.000Z :alice!u@h NICK changed");
+    RECV(":server CAP alice DEL :draft/chathistory");
+    RECV(":server BATCH -h");
+    STRCMP_EQUAL("alice", ptr_server->nick);
+    RECORD_CHECK_NO_MSG();
+}
+
+TEST(IrcProtocolWithServer, HistoryLimits)
+{
+    SRV_INIT_JOIN;
+    LONGS_EQUAL(0, irc_history_limit (ptr_server));
+    RECV(":server 005 alice CHATHISTORY=1 :supported");
+    LONGS_EQUAL(1, irc_history_limit (ptr_server));
+    RECV(":server 005 alice CHATHISTORY=0 :supported");
+    LONGS_EQUAL(100, irc_history_limit (ptr_server));
+    RECV(":server 005 alice CHATHISTORY=100000 :supported");
+    LONGS_EQUAL(100, irc_history_limit (ptr_server));
+    RECV(":server 005 alice CHATHISTORY=-2 :supported");
+    LONGS_EQUAL(0, irc_history_limit (ptr_server));
+    RECV(":server 005 alice CHATHISTORY=999999999999999999999999999 :supported");
+    LONGS_EQUAL(0, irc_history_limit (ptr_server));
+}
+
+TEST(IrcProtocolWithServer, HistoryBatchBound)
+{
+    HISTORY_SETUP;
+    irc_history_request (ptr_server, "#test");
+    RECV(":server BATCH +h chathistory #test");
+    for (int i = 0; i < 1001; i++)
+        irc_batch_add_message (ptr_server, "h", "@batch=h;time=2026-10-13T10:00:01.000Z :bob!u@h PRIVMSG #test :overflow");
+    struct t_irc_batch *batch = irc_batch_search (ptr_server, "h");
+    CHECK(batch);
+    LONGS_EQUAL(1, batch->history_invalid);
+    POINTERS_EQUAL(NULL, batch->messages);
+    RECV(":server BATCH -h");
+    RECORD_CHECK_NO_MSG();
+}
+
+TEST(IrcProtocolWithServer, HistoryPersistence)
+{
+    HISTORY_SETUP;
+    RECV("@time=2026-10-13T10:00:01.123Z;msgid=persisted :bob!u@h PRIVMSG #test :seen");
+    /* Recreate the history subsystem from its on-disk config, losing all RAM. */
+    irc_history_end ();
+    irc_history_init ();
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT("CHATHISTORY AFTER #test msgid=persisted 2");
+}
+
+TEST(IrcProtocolWithServer, HistoryLiveAfterReplay)
+{
+    HISTORY_SETUP;
+    irc_history_request (ptr_server, "#test");
+    RECV(":server BATCH +h chathistory #test");
+    RECV("@batch=h;time=2026-10-13T10:00:01.000Z;msgid=a :bob!u@h PRIVMSG #test :old");
+    RECV(":server BATCH -h");
+    CHECK_CHAN("bob", "old", HISTORY_TAGS);
+    RECV("@time=2026-10-13T10:00:01.000Z;msgid=a :bob!u@h PRIVMSG #test :old");
+    RECORD_CHECK_NO_MSG();
+}
+
+TEST(IrcProtocolWithServer, HistoryPrivateAndSelfReplay)
+{
+    HISTORY_SETUP;
+    run_cmd_quiet ("/query -server fake bob");
+    irc_history_request (ptr_server, "bob");
+    CHECK_SENT("CHATHISTORY LATEST bob * 2");
+    RECV(":server BATCH +h chathistory bob");
+    RECV("@batch=h;time=2026-10-13T10:00:01.000Z;msgid=a :bob!u@h PRIVMSG alice :incoming");
+    RECV("@batch=h;time=2026-10-13T10:00:02.000Z;msgid=b :alice!u@h PRIVMSG bob :outgoing");
+    RECV(":server BATCH -h");
+    CHECK_PV("bob", "bob", "incoming", HISTORY_TAGS);
+    CHECK_PV("bob", "alice", "outgoing", HISTORY_TAGS);
+}
+
+TEST(IrcProtocolWithServer, HistorySortAndNotice)
+{
+    HISTORY_SETUP;
+    irc_history_request (ptr_server, "#test");
+    RECV(":server BATCH +h chathistory #test");
+    RECV("@batch=h;time=2026-10-13T10:00:02.000Z;msgid=b :bob!u@h NOTICE #test :second");
+    RECV("@batch=h;time=2026-10-13T10:00:01.000Z;msgid=a :bob!u@h PRIVMSG #test :first");
+    RECV(":server BATCH -h");
+    LONGS_EQUAL(2, record_count_messages ());
+    struct t_hashtable *first = (struct t_hashtable *)arraylist_get (recorded_messages, 0);
+    struct t_hashtable *second = (struct t_hashtable *)arraylist_get (recorded_messages, 1);
+    STRCMP_EQUAL("first", (const char *)hashtable_get (first, "message"));
+    STRCMP_EQUAL("second", (const char *)hashtable_get (second, "message"));
+    irc_history_disconnect (ptr_server);
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT("CHATHISTORY AFTER #test msgid=b 2");
+}
+
+TEST(IrcProtocolWithServer, HistoryNestedBatch)
+{
+    HISTORY_SETUP;
+    irc_history_request (ptr_server, "#test");
+    RECV(":server BATCH +outer chathistory #test");
+    RECV("@batch=outer :server BATCH +inner draft/multiline #test");
+    RECV("@batch=inner :alice!u@h NICK changed");
+    RECV("@batch=outer :server BATCH -inner");
+    RECV(":server BATCH -outer");
+    STRCMP_EQUAL("alice", ptr_server->nick);
+    RECORD_CHECK_NO_MSG();
+}
+
+
+TEST(IrcProtocolWithServer, HistoryRefusedAndDependencies)
+{
+    run_cmd_quiet ("/mute /set irc.server.fake.capabilities *,draft/chathistory");
+    RECV(":server CAP * LS :batch server-time draft/chathistory");
+    LONGS_EQUAL(0, irc_history_enabled (ptr_server));
+    for (int i = 0; i < arraylist_size (sent_messages); i++)
+        CHECK(!strstr ((const char *)arraylist_get (sent_messages, i), "draft/chathistory"));
+    RECV(":server CAP * NAK :draft/chathistory");
+    SRV_INIT_JOIN;
+    RECV(":server 005 alice CHATHISTORY=2 :supported");
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT(NULL);
+}
+
+TEST(IrcProtocolWithServer, HistoryInvalidReferenceFallback)
+{
+    HISTORY_SETUP;
+    RECV("@time=2026-10-13T10:00:01.000Z;msgid=a :bob!u@h PRIVMSG #test :seen");
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT("CHATHISTORY AFTER #test msgid=a 2");
+    RECV(":server FAIL CHATHISTORY INVALID_MSGREFTYPE AFTER #test :unsupported");
+    CHECK_SENT("CHATHISTORY AFTER #test timestamp=2026-10-13T10:00:00.999Z 2");
+    RECV(":server FAIL CHATHISTORY INVALID_MSGREFTYPE AFTER #test :unsupported");
+    CHECK_SENT(NULL);
+}
+
+TEST(IrcProtocolWithServer, HistoryTimestampBoundary)
+{
+    HISTORY_SETUP;
+    RECV(":server 005 alice MSGREFTYPES=timestamp :supported");
+    RECV("@time=2026-10-13T10:00:01.123Z :bob!u@h PRIVMSG #test :seen");
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT("CHATHISTORY AFTER #test timestamp=2026-10-13T10:00:01.122Z 2");
+    RECV("@draft/chathistory-end :server BATCH +h chathistory #test");
+    RECV("@batch=h;time=2026-10-13T10:00:01.123Z :bob!u@h PRIVMSG #test :seen");
+    RECV("@batch=h;time=2026-10-13T10:00:01.123Z :bob!u@h PRIVMSG #test :missed");
+    RECV(":server BATCH -h");
+    CHECK_CHAN("bob", "missed", HISTORY_TAGS);
+    LONGS_EQUAL(1, record_count_messages ());
+}
+
+TEST(IrcProtocolWithServer, HistoryOuterBatchAndContext)
+{
+    HISTORY_SETUP;
+    irc_history_request (ptr_server, "#test");
+    RECV(":server BATCH +outer example/wrapper");
+    RECV("@batch=outer :server BATCH +h chathistory #test");
+    RECV("@batch=h;time=2026-10-13T10:00:01.000Z;msgid=a :bob!u@h PRIVMSG #test :stored");
+    RECV("@batch=h;draft/chathistory-context;time=2026-10-13T10:00:59.000Z;msgid=context :bob!u@h TAGMSG #test");
+    RECV("@batch=outer :server BATCH -h");
+    RECORD_CHECK_NO_MSG();
+    RECV(":server BATCH -outer");
+    CHECK_CHAN("bob", "stored", HISTORY_TAGS);
+    LONGS_EQUAL(1, record_count_messages ());
+    irc_history_disconnect (ptr_server);
+    irc_history_request (ptr_server, "#test");
+    CHECK_SENT("CHATHISTORY AFTER #test msgid=a 2");
+}
+
+TEST(IrcProtocolWithServer, HistoryPageCeilingAndResume)
+{
+    char line[512];
+
+    HISTORY_SETUP;
+    RECV("@time=2026-10-13T10:00:00.000Z;msgid=0 :bob!u@h PRIVMSG #test :start");
+    irc_history_request (ptr_server, "#test");
+    for (int i = 1; i <= 10; i++)
+    {
+        RECV(":server BATCH +h chathistory #test");
+        snprintf (line, sizeof (line),
+                  "@batch=h;time=2026-10-13T10:00:%02d.000Z;msgid=%d :bob!u@h PRIVMSG #test :page", i, i);
+        RECV(line);
+        RECV(":server BATCH -h");
+    }
+    CHECK_SENT(NULL);
+    RECV("@time=2026-10-13T10:00:59.000Z;msgid=live :bob!u@h PRIVMSG #test :new live");
+    server_input_data ("irc.fake.#test", "/chathistory");
+    CHECK_SENT("CHATHISTORY AFTER #test msgid=10 2");
+}
+
+TEST(IrcProtocolWithServer, HistoryDoesNotReplyToCtcp)
+{
+    HISTORY_SETUP;
+    irc_history_request (ptr_server, "#test");
+    RECV(":server BATCH +h chathistory #test");
+    RECV("@batch=h;time=2026-10-13T10:00:01.000Z :bob!u@h PRIVMSG #test :\001VERSION\001");
+    RECV(":server BATCH -h");
+    CHECK_SENT(NULL);
+    LONGS_EQUAL(1, record_count_messages ());
+}
+
+
+TEST(IrcProtocolWithServer, HistoryDisconnectFromPrintHook)
+{
+    HISTORY_SETUP;
+    irc_history_request (ptr_server, "#test");
+    struct t_hook *hook = hook_print (
+        NULL, NULL, "irc_chathistory", NULL, 1,
+        [](const void *pointer, void *, struct t_gui_buffer *, time_t, int, int,
+           const char **, int, int, const char *, const char *) -> int
+        {
+            irc_server_disconnect ((struct t_irc_server *)pointer, 0, 0);
+            return 0;
+        }, ptr_server, NULL);
+    RECV(":server BATCH +h chathistory #test");
+    RECV("@batch=h;time=2026-10-13T10:00:01.000Z;msgid=a :bob!u@h PRIVMSG #test :first");
+    RECV("@batch=h;time=2026-10-13T10:00:02.000Z;msgid=b :bob!u@h PRIVMSG #test :second");
+    RECV(":server BATCH -h");
+    LONGS_EQUAL(0, ptr_server->is_connected);
+    POINTERS_EQUAL(NULL, ptr_server->batches);
+    unhook (hook);
 }

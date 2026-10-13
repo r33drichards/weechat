@@ -14,6 +14,7 @@
 #include "irc.h"
 #include "irc-bar-item.h"
 #include "irc-batch.h"
+#include "irc-history.h"
 #include "irc-buffer.h"
 #include "irc-channel.h"
 #include "irc-color.h"
@@ -202,6 +203,7 @@ weechat_plugin_init (struct t_weechat_plugin *plugin, int argc, char *argv[])
         return WEECHAT_RC_ERROR;
 
     irc_config_read ();
+    irc_history_init ();
 
     irc_theme_init ();
 
@@ -336,8 +338,9 @@ weechat_plugin_end (struct t_weechat_plugin *plugin)
 
     irc_raw_end ();
 
-    irc_server_free_all ();
+    irc_history_end ();
 
+    irc_server_free_all ();
     irc_config_free ();
 
     irc_notify_end ();

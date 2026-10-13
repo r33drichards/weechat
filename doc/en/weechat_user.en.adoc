@@ -3447,6 +3447,7 @@ WeeChat supports the following https://ircv3.net/irc/[IRCv3 extensions ^↗^^]:
 * <<irc_ircv3_batch,batch>>
 * <<irc_ircv3_cap_notify,cap-notify>>
 * <<irc_ircv3_chghost,chghost>>
+* <<irc_ircv3_draft_chathistory,draft/chathistory (opt-in)>>
 * <<irc_ircv3_draft_multiline,draft/multiline>>
 * <<irc_ircv3_echo_message,echo-message>>
 * <<irc_ircv3_extended_join,extended-join>>
@@ -3467,6 +3468,73 @@ automatically enabled
 
 Tables with comparison of different IRC clients, including WeeChat, are available
 on https://ircv3.net/software/clients[this page ^↗^^].
+
+[[irc_ircv3_draft_chathistory]]
+==== draft/chathistory
+
+Specification: https://ircv3.net/specs/extensions/chathistory[chathistory ^↗^^]
+
+History catch-up is opt-in. It requires a server or bouncer that stores messages
+and advertises `draft/chathistory`, `batch`, `server-time` and `message-tags`.
+The draft capability is deliberately excluded from the `*` default, because
+negotiating it asks the server to suppress its usual automatic replay.
+
+For a server named `example`, enable it and reconnect:
+
+----
+/set irc.server.example.capabilities "*,!draft/multiline,draft/chathistory"
+/reconnect example
+----
+
+The example excludes multiline: nested batches inside a history response are
+currently rejected without advancing the cursor. Do not enable
+`draft/event-playback`; replayed state changes are not supported.
+
+On joining a channel, WeeChat requests the latest page when it has no saved
+cursor, or messages after its saved cursor otherwise. Open private buffers are
+also caught up. Run `/chathistory` in a chat buffer to resume a paused catch-up.
+There is no `TARGETS` discovery: private conversations whose buffers are not
+open, and channels you have not rejoined, are not requested. Restore your
+channels with `autojoin` after a process restart.
+
+Requests require acknowledged capabilities and the mandatory `CHATHISTORY`
+ISUPPORT limit. Each request is limited to the smaller of 100 and the server's
+limit (zero means unlimited on the server). Catch-up stops after ten pages per
+buffer, an empty page, the server's `draft/chathistory-end` tag, or a page that
+cannot advance the cursor. A full first page is only the latest context; it is
+not an attempt to retrieve all retained history.
+
+The advertised `MSGREFTYPES` preference is respected. Without it, WeeChat prefers
+message IDs and falls back to timestamps. Timestamp requests overlap the last
+millisecond, with duplicate suppression, to retain messages sharing that time.
+If timestamp-only pagination cannot advance (for example, more messages share
+one millisecond than fit in a page), catch-up pauses instead of skipping ahead.
+Live messages do not advance the cursor over an unresolved gap.
+
+Completed pages are appended in timestamp order, retaining server order for
+equal timestamps. Live messages are displayed immediately, so a completed
+history page can appear below newer live messages; existing lines are not
+reordered. Replay has the tags `irc_chathistory`, `notify_none`, `no_highlight`
+and `no_log`. It cannot reply to CTCP, modify nicklists or trigger live IRC
+receive signals. CTCP is displayed as inert text. Ignore rules are respected.
+Optional `draft/chathistory-context` lines are ignored and never advance cursors.
+
+Per server configuration name and target, WeeChat stores only the cursor
+(timestamp and optional message ID) in `irc_history.conf`. Completed pages are
+checkpointed immediately; live cursors are checkpointed every five seconds and
+on normal exit or upgrade. Persist WeeChat's configuration directory across
+scale-to-zero restarts. A crash can replay up to one checkpoint interval;
+duplicate identities are retained only in memory, with a 256-message window per
+target. Without IDs, identical sender/text/timestamp messages are indistinguishable.
+Deleting a server removes its cursor; reusing a server name for another network
+requires removing its old cursor data while WeeChat is stopped.
+
+History storage is bounded to 256 targets, 16 active history batches per server,
+and 1000 messages or 1 MiB per batch. Incomplete requests time out after 30
+seconds. Malformed, oversized and unsupported nested responses do not advance
+the cursor. Unsupported message-ID references get at most one timestamp retry;
+other errors pause catch-up. This feature cannot recover messages the server did
+not store, no longer retains, or will not authorize you to read.
 
 [[irc_ircv3_account_notify]]
 ==== account-notify
